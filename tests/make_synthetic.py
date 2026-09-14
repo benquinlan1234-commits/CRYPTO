@@ -80,10 +80,11 @@ def generate(outdir, start="2021-01-01", end="2026-09-01", effect_bps=0.0, seed=
             r = sig[s][i]
             if s in FOUR_HOUR and t >= SWITCH:
                 # same 8h carry, delivered as two 4h settlements
-                rows.append({"ts": t - pd.Timedelta(hours=4), "rate": r * 0.5, "symbol": s})
-                rows.append({"ts": t, "rate": r * 0.5, "symbol": s})
+                rows.append({"ts": t - pd.Timedelta(hours=4), "rate": r * 0.5,
+                             "interval_h": 4, "symbol": s})
+                rows.append({"ts": t, "rate": r * 0.5, "interval_h": 4, "symbol": s})
             else:
-                rows.append({"ts": t, "rate": r, "symbol": s})
+                rows.append({"ts": t, "rate": r, "interval_h": 8, "symbol": s})
         pd.DataFrame(rows).to_parquet(outdir / f"binance_funding_{s}.parquet", index=False)
 
     return outdir

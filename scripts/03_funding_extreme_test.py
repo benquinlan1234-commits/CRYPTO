@@ -73,13 +73,36 @@ def build_panel(funding: pd.DataFrame, klines: pd.DataFrame) -> pd.DataFrame:
     )
 
     # --- signal: funding settled in (t-8h, t], summed per bucket
+    #
+    # Summing the raw rates inside the bucket makes a 4h-funding symbol and an
+    # 8h-funding symbol directly comparable: both become the carry actually paid
+    # over the same 8 hours. Ranking raw per-settlement rates instead would sort
+    # the 4h names systematically low for a purely mechanical reason.
     f = funding.copy()
     # bucket label = the grid point at or after the settlement, i.e. ceil
     f["grid"] = f["ts"].dt.ceil(f"{GRID_H}h")
-    sig = (f.groupby(["symbol", "grid"], as_index=False)
-             .agg(signal=("rate", "sum"), n_settlements=("rate", "size")))
+    agg = {"signal": ("rate", "sum"), "n_settlements": ("rate", "size")}
+    if "interval_h" in f.columns:
+        agg["interval_h"] = ("interval_h", "median")
+    sig = f.groupby(["symbol", "grid"], as_index=False).agg(**agg)
     sig = sig.rename(columns={"grid": "ts"})
     sig = sig[sig["ts"].isin(grid)]
+
+    # The archive carries funding_interval_hours per row, so bucket completeness
+    # is checked against what the venue says rather than guessed from spacing.
+    # A bucket missing a settlement is scaled to a full 8h of carry; a bucket
+    # missing most of its settlements is dropped rather than extrapolated.
+    if "interval_h" in sig.columns:
+        iv = pd.to_numeric(sig["interval_h"], errors="coerce")
+        expected = (GRID_H / iv).round()
+        expected = expected.where(expected >= 1, 1.0)
+        ratio = expected / sig["n_settlements"]
+        sig["bucket_complete"] = (sig["n_settlements"] >= expected).fillna(True)
+        scale = ratio.where(ratio.notna() & (ratio > 1) & (ratio <= 2), 1.0)
+        sig["signal"] = sig["signal"] * scale
+        sig = sig[(ratio.isna()) | (ratio <= 2)]
+    else:
+        sig["bucket_complete"] = True
 
     # --- forward returns off the grid
     frames = []
@@ -110,6 +133,10 @@ def run_cell(panel: pd.DataFrame, h: int, q: float, fee_bps: float) -> pd.DataFr
     """Form the long-short book at every grid point. Returns one row per rebalance."""
     col = f"fwd_{h}h"
     d = panel.dropna(subset=["signal", col]).copy()
+    if "slice" not in d.columns:
+        # Callers normally pass one slice at a time; a whole-sample diagnostic
+        # run is demeaned per symbol over whatever it was handed.
+        d["slice"] = "_all"
 
     # Drift demeaning before anything directional is claimed.
     d["ret_dm"] = demean_drift(d, col, mode="slice")

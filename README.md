@@ -1,55 +1,62 @@
 # crypto-perp-research
 
-Perp research separate from the NQ work. Nothing here touches `reclaim-mbo`.
+Perp research, separate from the NQ work. Nothing here touches `reclaim-mbo`.
 
-## Status: task 1 is blocked on network, not on code
+## Data source: the Vision archive, not the API
 
-This repo was authored in a remote container whose egress policy is an
-allowlist covering GitHub and package registries only. **Every** market-data
-host is refused at the proxy with a 403 on CONNECT:
+`fapi.binance.com` answers **451** from Australia. `data.binance.vision` does
+not, goes back to **2020-01**, and needs no key — so the archive replaces API
+access entirely.
 
-| host | result |
-|---|---|
-| `fapi.binance.com`, `api.binance.com` | 403 CONNECT — egress denied |
-| `api.bybit.com` | 403 CONNECT — egress denied |
-| `www.okx.com` | 403 CONNECT — egress denied |
-| `data.binance.vision` | 403 CONNECT — egress denied |
-| `api.coingecko.com`, `api.kraken.com`, `api.hyperliquid.xyz` | 403 CONNECT — egress denied |
-| `api.github.com`, `pypi.org` | 200 |
-
-OKX is on that list, and OKX worked from the earlier chat sandbox — so this is
-the container's egress policy, **not** a geo-block, and it says nothing about
-whether Binance is reachable from Australia. That question is still open and
-only your machine can answer it.
-
-So the probe is built rather than run. One command answers task 1:
+**This container cannot reach the archive either.** Its egress policy is an
+allowlist covering GitHub and package registries; `data.binance.vision:443`
+returns `connect_rejected` at the proxy, same as every other market-data host
+(OKX included, which is how we know it is the policy and not a geo-block). So
+**the download runs on your machine**:
 
 ```bash
 pip install -r requirements.txt
-python scripts/01_probe_access.py
+python scripts/02_download_vision.py --slim      # 14 symbols, 2020-01 -> now
+python scripts/03_funding_extreme_test.py --venue binance
 ```
 
-It distinguishes `geo_blocked` (HTTP 451 / restricted-location 403 — the venue
-refusing your jurisdiction) from `egress_denied` (your network refusing the
-connection) so the answer is unambiguous, and prints the earliest funding
-timestamp each venue actually serves plus what a 60/20/20 split would give.
+Resumable — a month already cached is skipped, so an interrupted run costs
+nothing to restart. Months before a symbol listed return 404 and are counted,
+not raised.
 
-Then:
+`--slim` keeps only `ts/close/symbol` for klines, which is all the test uses.
+Expected cache size for 14 symbols over 6.7 years:
+
+| | rows | size |
+|---|---|---|
+| funding | ~102k | 1.9 MB |
+| klines `--slim` | ~818k | 15.4 MB |
+| klines full OHLCV | ~818k | 48 MB |
+
+**~17 MB for funding + slim klines**, so you can commit `data/cache/` and I'll
+run the analysis here. (`.gitignore` currently excludes it — `git add -f
+data/cache/*.parquet` to override.) Otherwise run `03_` locally and paste the
+output.
+
+## Run order
+
+```
+scripts/01_probe_access.py      venue reachability + history depth (API venues)
+scripts/02_download_vision.py   archive -> local parquet cache      [needs network]
+scripts/03_funding_extreme_test.py   the frozen test                 [offline]
+```
+
+The holdout is behind `--touch-holdout` so it cannot be burned by a re-run.
+
+## What is validated
+
+20 checks, all passing, none of which need archive access:
 
 ```bash
-python scripts/02_fetch_funding.py --venue binance          # cache funding + 1h klines
-python scripts/03_funding_extreme_test.py --venue binance   # exploration + validation
-python scripts/03_funding_extreme_test.py --venue binance --touch-holdout   # once, at the end
-```
-
-## What is validated, and what is not
-
-The analysis harness is tested end to end against synthetic data with a known
-planted truth — which is independent of having exchange access, so it is done:
-
-```
-python tests/test_protocol.py            # 8 checks
-python tests/test_pipeline_synthetic.py  # 4 checks
+python tests/test_protocol.py           # 8  statistical harness
+python tests/test_vision_format.py      # 6  archive format
+python tests/test_pipeline_synthetic.py # 4  end-to-end, known planted truth
+python tests/test_download_chain.py     # 2  archive ZIPs -> cache -> panel -> cell
 ```
 
 Results worth knowing:
@@ -57,60 +64,68 @@ Results worth knowing:
 * **Day-clustering is load-bearing.** On day-correlated data with a true effect
   of exactly zero, a naive t-test rejects **50.7%** of the time; the clustered
   test rejects **6.7%** against a nominal 5%.
-* **No lookahead in the grid alignment.** Under a true null across 12 seeds the
-  exploration median p is 0.61 with signs split 6+/6−. (12 seeds is a coarse
-  calibration — it rules out a gross leak, not a subtle one.)
+* **No lookahead.** Under a true null across 12 seeds, exploration median
+  p = 0.61, signs split 6+/6−. (Coarse — rules out a gross leak, not a subtle one.)
 * **A real effect is recovered.** A planted +30bps/8h reversion reads
   +46.6 / +54.8 / +45.2bps across the three slices; the ~1.6× is the long-short
   rank spread, so the magnitude is right, not just the sign.
-* **Drift demeaning removes drift exactly**, and the recorded 4h reversion
-  pattern (−17.8 → +54.6 → −19.2) correctly fails the sign-stability bar.
+* The recorded 4h reversion pattern (−17.8 → +54.6 → −19.2) correctly **fails**
+  the sign-stability bar.
 
-**Not validated:** anything about real market data. No real number has been
-computed. Every figure above comes from synthetic data.
+**No real market data has been touched.** Every number above is synthetic.
 
-## Two alignment traps the pipeline handles
+## Four traps handled, each with a test
 
-Both would have quietly corrupted the result:
+1. **Bar timestamps.** A kline stamped `open_time = t` covers `[t, t+1h)`, so
+   its close is the price at `t+1h`. Using it as the price at `t` hands the test
+   a free hour of the future. The price at `t` is the close of the bar *ending*
+   at `t`, and there is an assertion for it.
+2. **Archive timestamp units drift.** Binance moved parts of the archive from
+   millisecond to microsecond epochs during 2025. Reading a microsecond file as
+   milliseconds places the data in **year 56971** — the unit is sniffed per file
+   by magnitude.
+3. **Archive headers drift.** Older monthly files have no header row, newer ones
+   do. Parsing blind either eats the first observation or treats a header as
+   data. Both dialects are detected and tested to parse identically.
+4. **Mixed 4h/8h funding.** Ranking raw per-settlement rates sorts the 4h names
+   systematically low for a purely mechanical reason. Rates are summed into 8h
+   buckets so the ranked quantity is always 8h carry, and
+   `funding_interval_hours` — present in the archive file — is used to verify
+   bucket completeness rather than inferring the interval from spacing.
 
-1. **Kline timestamps.** A Binance bar stamped `open_time = t` covers
-   `[t, t+1h)`, so its close is the price at `t+1h`. Using it as the price at
-   `t` hands the test a free hour of the future. The price at `t` is the close
-   of the bar *ending* at `t`. There is a test asserting this.
-2. **Mixed funding intervals.** Binance moved several alts from 8h to 4h
-   funding. A raw cross-sectional rank across mixed intervals sorts the 4h
-   names systematically low for a purely mechanical reason. Rates are summed
-   into 8h buckets so the ranked quantity is always 8h carry.
-
-A third, subtler one: turnover is measured against the book opened `h` ago, not
+A fifth, subtler one: turnover is measured against the book opened `h` ago, not
 the previous grid point. At a 24h horizon on an 8h grid those differ, and
 getting it wrong charges full rotation every rebalance — 20bps instead of the
-~10bps the persistence of funding extremes actually implies.
+~10bps that the persistence of funding extremes actually implies.
+
+## Protocol
+
+Encoded in `src/cryptoresearch/protocol.py` so no single test can opt out:
+60/20/20 chronological split on a **shared calendar** (row-count splitting would
+give a late-listing alt different boundaries than BTC at the same instant),
+day/block-clustered inference, cross-sectional pooling, drift demeaning, sign
+stability across three slices as the bar, and Holm correction with the cell
+count stated.
 
 ## Layout
 
 ```
-PREREGISTRATION.md              frozen pre-data: hypothesis, 4 cells, pass criteria
-src/cryptoresearch/exchanges.py Binance / Bybit / OKX clients + reachability probe
-src/cryptoresearch/protocol.py  split, demeaning, clustered inference, Holm, sign bar
-scripts/01_probe_access.py      task 1: reachability + history depth
-scripts/02_fetch_funding.py     cached multi-year pull
-scripts/03_funding_extreme_test.py  the test, holdout gated behind a flag
-tests/                          harness + end-to-end validation
+PREREGISTRATION.md                    frozen pre-data: hypothesis, 4 cells, pass/kill criteria
+src/cryptoresearch/binance_vision.py  archive URLs, ZIP/CSV parsing, unit + header sniffing
+src/cryptoresearch/exchanges.py       Binance/Bybit/OKX API clients + reachability probe
+src/cryptoresearch/protocol.py        split, demeaning, clustered inference, Holm, sign bar
+scripts/                              probe / download / test
+tests/                                20 checks
 ```
 
-## Protocol
+## Task 2 — order-book microstructure
 
-Carried over unchanged and encoded in `src/cryptoresearch/protocol.py` so no
-single test can opt out: 60/20/20 chronological split on a shared calendar,
-day/block-clustered inference, cross-sectional pooling, drift demeaning,
-sign stability across three slices as the bar, Holm correction with the cell
-count stated, and no signal that needs a formation window.
+Not started, and deliberately so: the execution-cost question comes first. At 1h
+the median BTC move is only ~2× round-trip cost, and it gets worse below that,
+so the thing to establish before any modelling is what a signal must clear.
+`bookdepth_url()` and `parse_bookdepth()` are in place for when that is settled.
 
-## Tasks 2 and 3
+## Task 3 — cross-sectional relative strength
 
-Not started. Task 2 (sub-hour order-book microstructure) needs tick or L2 data,
-which is a different pull entirely — and the cost bar there is tight enough
-that it should be settled before any modelling. Task 3 (cross-sectional
-relative strength) runs on the same funding-grid panel this repo already
-builds, so it is mostly a new `run_cell` and its own pre-registration.
+Not started. Runs on the same funding-grid panel `03_` already builds, so it is
+a new cell definition plus its own pre-registration.

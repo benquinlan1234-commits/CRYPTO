@@ -1,10 +1,14 @@
 # Pre-registration: funding-rate extremes (Task 1)
 
 **Frozen:** 2026-09-14, before any multi-year funding data existed on disk.
-**Status:** pre-data. The authoring session had no network route to any exchange,
-so nothing in this document could have been informed by looking at the answer.
-Amendments after the first `03_` run must be recorded in "Amendments" with a date
-and a reason.
+**Status:** pre-data. The authoring session had no network route to any exchange
+or to the archive, so nothing in this document could have been informed by
+looking at the answer. Amendments after the first `03_` run must be recorded in
+"Amendments" with a date and a reason.
+
+**Data source:** `data.binance.vision`, futures/um monthly `fundingRate` and
+`klines/1h`, from 2020-01. The `fapi.binance.com` API answers 451 from
+Australia; the archive does not, and reaches further back regardless.
 
 ## 1. The unresolved question
 
@@ -72,11 +76,19 @@ mechanically about half an 8h symbol's for the same annualized carry, so the
 4h names would sort to the bottom for a reason that has nothing to do with
 crowding.
 
-Mitigation, fixed in advance: every rate is converted to an **8h-equivalent**
-(`rate × 8 / interval_hours`) before ranking, where the interval is inferred
-per symbol per period from the observed settlement spacing. The common grid is
-00:00 / 08:00 / 16:00 UTC; for a symbol funding more often, the rates settled
-inside each 8h bucket are summed.
+Mitigation, fixed in advance: the ranked quantity is always **8h carry** — the
+funding actually paid over the same eight hours. The common grid is
+00:00 / 08:00 / 16:00 UTC, and the raw rates settled inside each 8h bucket are
+summed. For an 8h symbol the bucket holds one settlement and the sum is the rate
+itself; for a 4h symbol it holds two, and their sum is the comparable quantity.
+No per-rate rescaling is applied, because summing already produces the
+like-for-like figure.
+
+The archive carries `funding_interval_hours` in the file, so the interval is
+**read, not inferred from settlement spacing**. It is used to check bucket
+completeness: a bucket holding fewer settlements than the stated interval
+implies is scaled up to a full 8h of carry, and one missing more than half its
+settlements is dropped rather than extrapolated.
 
 ## 6. Cells tested — count stated up front
 
@@ -149,4 +161,10 @@ whose verdict was blocked by data length rather than by the data.
 
 ## Amendments
 
-*(none)*
+**2026-09-14 (pre-data, before any `03_` run on real data).** Data source changed
+from the Binance REST API to the `data.binance.vision` archive, because the API
+is geo-blocked (451) from Australia while the archive is not. Consequences:
+history starts 2020-01 rather than at the API's retention limit, and
+`funding_interval_hours` is read from the file instead of inferred from
+settlement spacing — see §5. No hypothesis, cell, cutoff, horizon or pass
+criterion was changed. Recorded here rather than edited in silently.
